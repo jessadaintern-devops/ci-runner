@@ -1,0 +1,169 @@
+name: terraform-gitops
+
+on:
+  push:
+    branches:
+      - develop
+  workflow_dispatch:
+
+jobs:
+  mock-terraform-plan:
+    name: Mock Terraform Plan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Run plan mock
+        run: |
+          echo "Hello from Plan"
+          echo "Planning..."
+          cat > plan_output.json <<EOF
+          {
+              "format_version": "1.2",
+              "terraform_version": "1.11.4",
+              "planned_values": {
+                  "root_module": {
+                      "resources": [
+                          {
+                              "address": "google_pubsub_topic.my_topic1",
+                              "mode": "managed",
+                              "type": "google_pubsub_topic",
+                              "name": "my_topic1",
+                              "provider_name": "registry.terraform.io/hashicorp/google",
+                              "schema_version": 0,
+                              "values": {
+                                  "name": "terraform-sample-topic1",
+                                  "project": "myorder-beta"
+                              }
+                          },
+                          {
+                              "address": "google_pubsub_topic.my_topic2",
+                              "mode": "managed",
+                              "type": "google_pubsub_topic",
+                              "name": "my_topic2",
+                              "provider_name": "registry.terraform.io/hashicorp/google",
+                              "schema_version": 0,
+                              "values": {
+                                  "name": "terraform-sample-topic2",
+                                  "project": "myorder-beta"
+                              }
+                          }
+                      ]
+                  }
+              },
+              "resource_changes": [
+                  {
+                      "address": "google_pubsub_topic.my_topic2",
+                      "mode": "managed",
+                      "type": "google_pubsub_topic",
+                      "name": "my_topic2",
+                      "provider_name": "registry.terraform.io/hashicorp/google",
+                      "change": {
+                          "actions": ["create"],
+                          "before": null,
+                          "after": {
+                              "name": "terraform-sample-topic2",
+                              "project": "myorder-beta"
+                          },
+                          "after_unknown": {
+                              "id": true
+                          }
+                      }
+                  }
+              ],
+              "timestamp": "2025-09-08T07:16:55Z",
+              "applyable": true,
+              "complete": true,
+              "errored": false
+          }
+          EOF
+
+      - name: Upload mock plan artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: plan_output
+          path: plan_output.json
+          retention-days: 1
+
+  update-subscription:
+    name: Update Subscription
+    runs-on: ubuntu-latest
+    needs: mock-terraform-plan
+    env:
+      ENVIRONMENT: develop
+      GITOPS_REPO: git@gitlab.com:jessada.intern/gitlab-runner-vm.git
+      FILE_PATH: mod-gitops-non-prod/develop/mod-monitoring/config/prometheus
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: plan_output
+          path: .
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Git config
+        run: |
+          git config --global user.email "${ENVIRONMENT}-dev-portal-gitlab-runner@myorder.ai"
+          git config --global user.name "Dev Portal GitLab Runner"
+
+      - name: Clone GitOps repo
+        run: |
+          git clone $GITOPS_REPO repo
+          cd repo
+          git checkout develop
+
+      - name: Install yq
+        run: |
+          sudo wget https://github.com/mikefarah/yq/releases/download/v4.47.1/yq_linux_amd64 -O /usr/local/bin/yq
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      - name: Update subscription.yml
+        run: |
+          OUTPUT_PATH=$(pwd)
+          cd repo/${FILE_PATH}
+          count=$(yq -p=json -o=json '.resource_changes | length' ${OUTPUT_PATH}/plan_output.json)
+          for i in $(seq 0 $((count - 1))); do
+            action=$(yq -p=json -o=json -r ".resource_changes[$i].change.actions[0]" ${OUTPUT_PATH}/plan_output.json)
+            if [[ "$action" == "create" ]]; then
+              name=$(yq -p=json -o=json -r ".resource_changes[$i].change.after.name" ${OUTPUT_PATH}/plan_output.json)
+              yq eval -i "
+                .data.\"extra-scrape-configs*yml\" |= (
+                  . | from_yaml
+                  | .scrape_configs[0].metric_relabel_configs += [{
+                      \"source_labels\": [\"subscription_id\"],
+                      \"regex\": \"$name\",
+                      \"target_label\": \"service\",
+                      \"replacement\": \"new-service\"
+                  }]
+                  | to_yaml
+                )
+              " subscription.yml
+            elif [[ "$action" == "delete" ]]; then
+              name=$(yq -p=json -o=json -r ".resource_changes[$i].change.before.name" ${OUTPUT_PATH}/plan_output.json)
+              yq eval -i "
+                .data.\"extra-scrape-configs*yml\" |= (
+                  . | from_yaml
+                  | (.scrape_configs[0].metric_relabel_configs[] | select(.regex == \"$name\")) |= null
+                  | .scrape_configs[0].metric_relabel_configs |= map(select(. != null))
+                  | to_yaml
+                )
+              " subscription.yml
+            fi
+          done
+
+      - name: Commit and push changes
+        run: |
+          cd repo
+          git add ${FILE_PATH}/subscription.yml
+          git commit -m "Update subscription" || echo "No changes to commit"
+          git pull origin develop --rebase
+          git push origin develop
