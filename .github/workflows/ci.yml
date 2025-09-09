@@ -120,6 +120,7 @@ jobs:
           cd repo
           git checkout develop
 
+
       - name: Install yq
         run: |
           sudo wget https://github.com/mikefarah/yq/releases/download/v4.47.1/yq_linux_amd64 -O /usr/local/bin/yq
